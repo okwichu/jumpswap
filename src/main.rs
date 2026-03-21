@@ -1,5 +1,8 @@
 #![windows_subsystem = "windows"]
 
+use jumpswap::{
+    SENTINEL, any_watched_game_running, is_injected_event, remap_virtual_key, should_enable_swap,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -18,19 +21,11 @@ static AUTO_DETECT: AtomicBool = AtomicBool::new(true);
 static GAME_RUNNING: AtomicBool = AtomicBool::new(false);
 static MANUAL_SWAP: AtomicBool = AtomicBool::new(false);
 
-const SENTINEL: usize = 0x4A534B59;
 const WM_TRAYICON: u32 = WM_USER + 1;
 const WM_GAME_STATE: u32 = WM_USER + 2; // posted by detector thread
 const IDM_SWAP: u32 = 1001;
 const IDM_AUTO: u32 = 1002;
 const IDM_QUIT: u32 = 1003;
-
-// Game process names to watch for (lowercase)
-const GAME_PROCESSES: &[&str] = &[
-    "fortniteclient-win64-shipping.exe",
-    "destiny2.exe",
-    "marathon.exe",
-];
 
 fn main() -> Result<()> {
     unsafe {
@@ -142,9 +137,8 @@ fn is_any_game_running() -> bool {
                         .position(|&c| c == 0)
                         .unwrap_or(entry.szExeFile.len())],
                 );
-                let exe_lower = exe_name.to_ascii_lowercase();
 
-                if GAME_PROCESSES.iter().any(|&g| exe_lower == g) {
+                if any_watched_game_running(std::iter::once(exe_name.as_str())) {
                     let _ = CloseHandle(snapshot);
                     return true;
                 }
@@ -166,8 +160,7 @@ fn update_swap_state() -> bool {
     let game = GAME_RUNNING.load(Ordering::SeqCst);
     let manual = MANUAL_SWAP.load(Ordering::SeqCst);
 
-    // Swap is on if manually toggled OR (auto-detect is on AND game is running)
-    let effective = manual || (auto && game);
+    let effective = should_enable_swap(manual, auto, game);
     SWAP_ENABLED.store(effective, Ordering::SeqCst);
     effective
 }
@@ -186,7 +179,9 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
     };
 
     set_tip(&mut nid, false);
-    Shell_NotifyIconW(NIM_ADD, &nid).ok()
+    let result = Shell_NotifyIconW(NIM_ADD, &nid).ok();
+    let _ = DestroyIcon(icon);
+    result
 }
 
 unsafe fn update_tray_icon(hwnd: HWND, enabled: bool) -> Result<()> {
@@ -202,7 +197,9 @@ unsafe fn update_tray_icon(hwnd: HWND, enabled: bool) -> Result<()> {
     };
 
     set_tip(&mut nid, enabled);
-    Shell_NotifyIconW(NIM_MODIFY, &nid).ok()
+    let result = Shell_NotifyIconW(NIM_MODIFY, &nid).ok();
+    let _ = DestroyIcon(icon);
+    result
 }
 
 fn set_tip(nid: &mut NOTIFYICONDATAW, enabled: bool) {
@@ -305,7 +302,6 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
 
 unsafe fn show_context_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().expect("Failed to create menu");
-    let swap_on = SWAP_ENABLED.load(Ordering::SeqCst);
     let manual = MANUAL_SWAP.load(Ordering::SeqCst);
     let auto = AUTO_DETECT.load(Ordering::SeqCst);
 
@@ -364,7 +360,6 @@ unsafe fn show_context_menu(hwnd: HWND) {
     PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)).ok();
 
     let _ = DestroyMenu(menu);
-    let _ = swap_on; // suppress unused warning
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -426,16 +421,11 @@ unsafe extern "system" fn keyboard_hook(
     if code as u32 == HC_ACTION && SWAP_ENABLED.load(Ordering::Relaxed) {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
 
-        if kb.dwExtraInfo == SENTINEL {
+        if is_injected_event(kb.dwExtraInfo) {
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
-        let vk = VIRTUAL_KEY(kb.vkCode as u16);
-        let swap_to = match vk {
-            VK_RETURN => Some(VK_SPACE),
-            VK_SPACE => Some(VK_RETURN),
-            _ => None,
-        };
+        let swap_to = remap_virtual_key(kb.vkCode as u16).map(VIRTUAL_KEY);
 
         if let Some(target_vk) = swap_to {
             let flags = if wparam.0 as u32 == WM_KEYUP || wparam.0 as u32 == WM_SYSKEYUP {
