@@ -1,9 +1,12 @@
 #![windows_subsystem = "windows"]
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
@@ -11,17 +14,28 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 static SWAP_ENABLED: AtomicBool = AtomicBool::new(false);
+static AUTO_DETECT: AtomicBool = AtomicBool::new(true);
+static GAME_RUNNING: AtomicBool = AtomicBool::new(false);
+static MANUAL_SWAP: AtomicBool = AtomicBool::new(false);
 
-const SENTINEL: usize = 0x4A534B59; // "JSKY" — marks our injected keys
+const SENTINEL: usize = 0x4A534B59;
 const WM_TRAYICON: u32 = WM_USER + 1;
+const WM_GAME_STATE: u32 = WM_USER + 2; // posted by detector thread
 const IDM_SWAP: u32 = 1001;
-const IDM_QUIT: u32 = 1002;
+const IDM_AUTO: u32 = 1002;
+const IDM_QUIT: u32 = 1003;
+
+// Game process names to watch for (lowercase)
+const GAME_PROCESSES: &[&str] = &[
+    "fortniteclient-win64-shipping.exe",
+    "destiny2.exe",
+    "marathon.exe",
+];
 
 fn main() -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
 
-        // Register window class
         let class_name = w!("JumpSwapClass");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -32,7 +46,6 @@ fn main() -> Result<()> {
         };
         RegisterClassExW(&wc);
 
-        // Create message-only window
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
@@ -48,25 +61,115 @@ fn main() -> Result<()> {
             None,
         )?;
 
-        // Create system tray icon
         add_tray_icon(hwnd)?;
 
-        // Install low-level keyboard hook
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)?;
 
-        // Message loop
+        // Start game detection thread
+        let hwnd_raw = hwnd.0 as usize;
+        thread::spawn(move || game_detector_thread(hwnd_raw));
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        // Cleanup
         let _ = UnhookWindowsHookEx(hook);
         remove_tray_icon(hwnd)?;
     }
 
     Ok(())
+}
+
+/// Background thread that polls for game processes every 3 seconds.
+fn game_detector_thread(hwnd_raw: usize) {
+    let mut was_running = false;
+    loop {
+        if !AUTO_DETECT.load(Ordering::SeqCst) {
+            // When auto-detect is off, just sleep and check again
+            if was_running {
+                was_running = false;
+                GAME_RUNNING.store(false, Ordering::SeqCst);
+                unsafe {
+                    let hwnd = HWND(hwnd_raw as *mut _);
+                    let _ = PostMessageW(Some(hwnd), WM_GAME_STATE, WPARAM(0), LPARAM(0));
+                }
+            }
+            thread::sleep(Duration::from_secs(3));
+            continue;
+        }
+
+        let running = is_any_game_running();
+        if running != was_running {
+            was_running = running;
+            GAME_RUNNING.store(running, Ordering::SeqCst);
+            unsafe {
+                let hwnd = HWND(hwnd_raw as *mut _);
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_GAME_STATE,
+                    WPARAM(running as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Check if any watched game process is currently running.
+fn is_any_game_running() -> bool {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let snapshot = match snapshot {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let exe_name = String::from_utf16_lossy(
+                    &entry.szExeFile[..entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len())],
+                );
+                let exe_lower = exe_name.to_ascii_lowercase();
+
+                if GAME_PROCESSES.iter().any(|&g| exe_lower == g) {
+                    let _ = CloseHandle(snapshot);
+                    return true;
+                }
+
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snapshot);
+        false
+    }
+}
+
+/// Recalculate effective swap state from manual toggle + auto-detect.
+fn update_swap_state() -> bool {
+    let auto = AUTO_DETECT.load(Ordering::SeqCst);
+    let game = GAME_RUNNING.load(Ordering::SeqCst);
+    let manual = MANUAL_SWAP.load(Ordering::SeqCst);
+
+    // Swap is on if manually toggled OR (auto-detect is on AND game is running)
+    let effective = manual || (auto && game);
+    SWAP_ENABLED.store(effective, Ordering::SeqCst);
+    effective
 }
 
 unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
@@ -82,11 +185,7 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
         ..Default::default()
     };
 
-    let tip = "JumpSwap (Off)";
-    let tip_wide: Vec<u16> = tip.encode_utf16().chain(std::iter::once(0)).collect();
-    let len = tip_wide.len().min(nid.szTip.len());
-    nid.szTip[..len].copy_from_slice(&tip_wide[..len]);
-
+    set_tip(&mut nid, false);
     Shell_NotifyIconW(NIM_ADD, &nid).ok()
 }
 
@@ -102,6 +201,11 @@ unsafe fn update_tray_icon(hwnd: HWND, enabled: bool) -> Result<()> {
         ..Default::default()
     };
 
+    set_tip(&mut nid, enabled);
+    Shell_NotifyIconW(NIM_MODIFY, &nid).ok()
+}
+
+fn set_tip(nid: &mut NOTIFYICONDATAW, enabled: bool) {
     let tip = if enabled {
         "JumpSwap (On)"
     } else {
@@ -110,8 +214,6 @@ unsafe fn update_tray_icon(hwnd: HWND, enabled: bool) -> Result<()> {
     let tip_wide: Vec<u16> = tip.encode_utf16().chain(std::iter::once(0)).collect();
     let len = tip_wide.len().min(nid.szTip.len());
     nid.szTip[..len].copy_from_slice(&tip_wide[..len]);
-
-    Shell_NotifyIconW(NIM_MODIFY, &nid).ok()
 }
 
 unsafe fn remove_tray_icon(hwnd: HWND) -> Result<()> {
@@ -124,8 +226,6 @@ unsafe fn remove_tray_icon(hwnd: HWND) -> Result<()> {
     Shell_NotifyIconW(NIM_DELETE, &nid).ok()
 }
 
-/// Create a simple 16x16 icon programmatically.
-/// Grey circle when off, green circle when on.
 unsafe fn create_swap_icon(enabled: bool) -> HICON {
     let size: i32 = 16;
     let hdc_screen = GetDC(None);
@@ -133,7 +233,6 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
     let bmp = CreateCompatibleBitmap(hdc_screen, size, size);
     let old_bmp = SelectObject(hdc, bmp.into());
 
-    // Black background
     let bg_brush = CreateSolidBrush(COLORREF(0x00000000));
     let rect = RECT {
         left: 0,
@@ -144,11 +243,10 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
     FillRect(hdc, &rect, bg_brush);
     let _ = DeleteObject(bg_brush.into());
 
-    // Draw filled circle: green when on, grey when off
     let color = if enabled {
-        COLORREF(0x0000CC00) // Green (BGR)
+        COLORREF(0x0000CC00)
     } else {
-        COLORREF(0x00808080) // Grey
+        COLORREF(0x00808080)
     };
     let brush = CreateSolidBrush(color);
     let pen = CreatePen(PS_SOLID, 1, color);
@@ -160,12 +258,10 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
     let _ = DeleteObject(brush.into());
     let _ = DeleteObject(pen.into());
 
-    // Create mask bitmap
     let hdc_mask = CreateCompatibleDC(Some(hdc_screen));
     let bmp_mask = CreateBitmap(size, size, 1, 1, None);
     let old_mask = SelectObject(hdc_mask, bmp_mask.into());
 
-    // White = transparent, black circle = opaque
     let white_brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
     let mask_rect = RECT {
         left: 0,
@@ -209,17 +305,39 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
 
 unsafe fn show_context_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().expect("Failed to create menu");
-    let enabled = SWAP_ENABLED.load(Ordering::SeqCst);
+    let swap_on = SWAP_ENABLED.load(Ordering::SeqCst);
+    let manual = MANUAL_SWAP.load(Ordering::SeqCst);
+    let auto = AUTO_DETECT.load(Ordering::SeqCst);
 
+    // Swap item shows manual state (checkmark = manually forced on)
     let mut swap_item = MENUITEMINFOW {
         cbSize: size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_ID | MIIM_STATE | MIIM_STRING,
         wID: IDM_SWAP,
-        fState: if enabled { MFS_CHECKED } else { MFS_UNCHECKED },
+        fState: if manual { MFS_CHECKED } else { MFS_UNCHECKED },
         dwTypeData: PWSTR(w!("Swap").as_ptr() as *mut _),
         ..Default::default()
     };
     let _ = InsertMenuItemW(menu, 0, true, &mut swap_item);
+
+    let mut auto_item = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_ID | MIIM_STATE | MIIM_STRING,
+        wID: IDM_AUTO,
+        fState: if auto { MFS_CHECKED } else { MFS_UNCHECKED },
+        dwTypeData: PWSTR(w!("Auto-detect games").as_ptr() as *mut _),
+        ..Default::default()
+    };
+    let _ = InsertMenuItemW(menu, 1, true, &mut auto_item);
+
+    // Separator
+    let mut sep = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_FTYPE,
+        fType: MFT_SEPARATOR,
+        ..Default::default()
+    };
+    let _ = InsertMenuItemW(menu, 2, true, &mut sep);
 
     let mut quit_item = MENUITEMINFOW {
         cbSize: size_of::<MENUITEMINFOW>() as u32,
@@ -228,17 +346,25 @@ unsafe fn show_context_menu(hwnd: HWND) {
         dwTypeData: PWSTR(w!("Quit").as_ptr() as *mut _),
         ..Default::default()
     };
-    let _ = InsertMenuItemW(menu, 1, true, &mut quit_item);
+    let _ = InsertMenuItemW(menu, 3, true, &mut quit_item);
 
-    // Required for tray menu to dismiss properly
     let _ = SetForegroundWindow(hwnd);
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    let _ = TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, Some(0), hwnd, None);
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+        pt.x,
+        pt.y,
+        Some(0),
+        hwnd,
+        None,
+    );
     PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)).ok();
 
     let _ = DestroyMenu(menu);
+    let _ = swap_on; // suppress unused warning
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -255,13 +381,26 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_GAME_STATE => {
+            // Posted by detector thread when game state changes
+            let effective = update_swap_state();
+            let _ = update_tray_icon(hwnd, effective);
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = (wparam.0 as u32) & 0xFFFF;
             match id {
                 IDM_SWAP => {
-                    let new_state = !SWAP_ENABLED.load(Ordering::SeqCst);
-                    SWAP_ENABLED.store(new_state, Ordering::SeqCst);
-                    let _ = update_tray_icon(hwnd, new_state);
+                    let new_manual = !MANUAL_SWAP.load(Ordering::SeqCst);
+                    MANUAL_SWAP.store(new_manual, Ordering::SeqCst);
+                    let effective = update_swap_state();
+                    let _ = update_tray_icon(hwnd, effective);
+                }
+                IDM_AUTO => {
+                    let new_auto = !AUTO_DETECT.load(Ordering::SeqCst);
+                    AUTO_DETECT.store(new_auto, Ordering::SeqCst);
+                    let effective = update_swap_state();
+                    let _ = update_tray_icon(hwnd, effective);
                 }
                 IDM_QUIT => {
                     let _ = remove_tray_icon(hwnd);
@@ -287,7 +426,6 @@ unsafe extern "system" fn keyboard_hook(
     if code as u32 == HC_ACTION && SWAP_ENABLED.load(Ordering::Relaxed) {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
 
-        // Don't process keys we injected ourselves
         if kb.dwExtraInfo == SENTINEL {
             return CallNextHookEx(None, code, wparam, lparam);
         }
@@ -320,7 +458,7 @@ unsafe extern "system" fn keyboard_hook(
             };
 
             SendInput(&[input], size_of::<INPUT>() as i32);
-            return LRESULT(1); // Suppress original key
+            return LRESULT(1);
         }
     }
 
