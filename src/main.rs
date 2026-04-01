@@ -11,6 +11,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -20,12 +21,14 @@ static SWAP_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_DETECT: AtomicBool = AtomicBool::new(true);
 static GAME_RUNNING: AtomicBool = AtomicBool::new(false);
 static MANUAL_SWAP: AtomicBool = AtomicBool::new(false);
+static AUTO_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
 const WM_TRAYICON: u32 = WM_USER + 1;
 const WM_GAME_STATE: u32 = WM_USER + 2; // posted by detector thread
 const IDM_SWAP: u32 = 1001;
 const IDM_AUTO: u32 = 1002;
 const IDM_QUIT: u32 = 1003;
+const IDM_STARTUP: u32 = 1004;
 
 fn main() -> Result<()> {
     unsafe {
@@ -159,8 +162,9 @@ fn update_swap_state() -> bool {
     let auto = AUTO_DETECT.load(Ordering::SeqCst);
     let game = GAME_RUNNING.load(Ordering::SeqCst);
     let manual = MANUAL_SWAP.load(Ordering::SeqCst);
+    let suppressed = AUTO_SUPPRESSED.load(Ordering::SeqCst);
 
-    let effective = should_enable_swap(manual, auto, game);
+    let effective = should_enable_swap(manual, auto, game, suppressed);
     SWAP_ENABLED.store(effective, Ordering::SeqCst);
     effective
 }
@@ -300,17 +304,56 @@ unsafe fn create_swap_icon(enabled: bool) -> HICON {
     icon
 }
 
+const STARTUP_REG_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const STARTUP_VALUE_NAME: PCWSTR = w!("JumpSwap");
+
+fn is_startup_enabled() -> bool {
+    unsafe {
+        let mut key = HKEY::default();
+        let result = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_REG_KEY, Some(0), KEY_READ, &mut key);
+        if result.is_err() {
+            return false;
+        }
+        let result = RegQueryValueExW(key, STARTUP_VALUE_NAME, None, None, None, None);
+        let _ = RegCloseKey(key);
+        result.is_ok()
+    }
+}
+
+fn set_startup_enabled(enable: bool) {
+    unsafe {
+        let mut key = HKEY::default();
+        let result = RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_REG_KEY, Some(0), KEY_WRITE, &mut key);
+        if result.is_err() {
+            return;
+        }
+        if enable {
+            // Get the path to the current executable
+            let mut buf = [0u16; 512];
+            let len = GetModuleFileNameW(None, &mut buf);
+            if len > 0 {
+                let exe_path_bytes =
+                    std::slice::from_raw_parts(buf.as_ptr() as *const u8, ((len + 1) as usize) * 2);
+                let _ = RegSetValueExW(key, STARTUP_VALUE_NAME, Some(0), REG_SZ, Some(exe_path_bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(key, STARTUP_VALUE_NAME);
+        }
+        let _ = RegCloseKey(key);
+    }
+}
+
 unsafe fn show_context_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().expect("Failed to create menu");
-    let manual = MANUAL_SWAP.load(Ordering::SeqCst);
+    let effective = SWAP_ENABLED.load(Ordering::SeqCst);
     let auto = AUTO_DETECT.load(Ordering::SeqCst);
 
-    // Swap item shows manual state (checkmark = manually forced on)
+    // Swap item reflects the effective swap state
     let mut swap_item = MENUITEMINFOW {
         cbSize: size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_ID | MIIM_STATE | MIIM_STRING,
         wID: IDM_SWAP,
-        fState: if manual { MFS_CHECKED } else { MFS_UNCHECKED },
+        fState: if effective { MFS_CHECKED } else { MFS_UNCHECKED },
         dwTypeData: PWSTR(w!("Swap").as_ptr() as *mut _),
         ..Default::default()
     };
@@ -326,6 +369,17 @@ unsafe fn show_context_menu(hwnd: HWND) {
     };
     let _ = InsertMenuItemW(menu, 1, true, &mut auto_item);
 
+    let startup = is_startup_enabled();
+    let mut startup_item = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_ID | MIIM_STATE | MIIM_STRING,
+        wID: IDM_STARTUP,
+        fState: if startup { MFS_CHECKED } else { MFS_UNCHECKED },
+        dwTypeData: PWSTR(w!("Run on startup").as_ptr() as *mut _),
+        ..Default::default()
+    };
+    let _ = InsertMenuItemW(menu, 2, true, &mut startup_item);
+
     // Separator
     let mut sep = MENUITEMINFOW {
         cbSize: size_of::<MENUITEMINFOW>() as u32,
@@ -333,7 +387,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         fType: MFT_SEPARATOR,
         ..Default::default()
     };
-    let _ = InsertMenuItemW(menu, 2, true, &mut sep);
+    let _ = InsertMenuItemW(menu, 3, true, &mut sep);
 
     let mut quit_item = MENUITEMINFOW {
         cbSize: size_of::<MENUITEMINFOW>() as u32,
@@ -342,7 +396,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         dwTypeData: PWSTR(w!("Quit").as_ptr() as *mut _),
         ..Default::default()
     };
-    let _ = InsertMenuItemW(menu, 3, true, &mut quit_item);
+    let _ = InsertMenuItemW(menu, 4, true, &mut quit_item);
 
     let _ = SetForegroundWindow(hwnd);
 
@@ -377,7 +431,9 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_GAME_STATE => {
-            // Posted by detector thread when game state changes
+            // Posted by detector thread when game state changes.
+            // Clear suppression so auto-detect works fresh for new game sessions.
+            AUTO_SUPPRESSED.store(false, Ordering::SeqCst);
             let effective = update_swap_state();
             let _ = update_tray_icon(hwnd, effective);
             LRESULT(0)
@@ -386,8 +442,17 @@ unsafe extern "system" fn wnd_proc(
             let id = (wparam.0 as u32) & 0xFFFF;
             match id {
                 IDM_SWAP => {
-                    let new_manual = !MANUAL_SWAP.load(Ordering::SeqCst);
-                    MANUAL_SWAP.store(new_manual, Ordering::SeqCst);
+                    let was_effective = SWAP_ENABLED.load(Ordering::SeqCst);
+                    if was_effective {
+                        // User wants swap OFF
+                        MANUAL_SWAP.store(false, Ordering::SeqCst);
+                        // Suppress auto-detect so it doesn't immediately re-enable
+                        AUTO_SUPPRESSED.store(true, Ordering::SeqCst);
+                    } else {
+                        // User wants swap ON
+                        MANUAL_SWAP.store(true, Ordering::SeqCst);
+                        AUTO_SUPPRESSED.store(false, Ordering::SeqCst);
+                    }
                     let effective = update_swap_state();
                     let _ = update_tray_icon(hwnd, effective);
                 }
@@ -396,6 +461,10 @@ unsafe extern "system" fn wnd_proc(
                     AUTO_DETECT.store(new_auto, Ordering::SeqCst);
                     let effective = update_swap_state();
                     let _ = update_tray_icon(hwnd, effective);
+                }
+                IDM_STARTUP => {
+                    let enabled = is_startup_enabled();
+                    set_startup_enabled(!enabled);
                 }
                 IDM_QUIT => {
                     let _ = remove_tray_icon(hwnd);

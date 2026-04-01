@@ -9,8 +9,63 @@ pub const GAME_PROCESSES: &[&str] = &[
 pub const VK_RETURN_CODE: u16 = 0x0D;
 pub const VK_SPACE_CODE: u16 = 0x20;
 
-pub fn should_enable_swap(manual_swap: bool, auto_detect: bool, game_running: bool) -> bool {
-    manual_swap || (auto_detect && game_running)
+pub fn should_enable_swap(
+    manual_swap: bool,
+    auto_detect: bool,
+    game_running: bool,
+    auto_suppressed: bool,
+) -> bool {
+    manual_swap || (auto_detect && game_running && !auto_suppressed)
+}
+
+/// Testable state machine for swap logic, mirroring the AtomicBool statics in main.
+#[derive(Debug, Default)]
+pub struct SwapState {
+    pub manual_swap: bool,
+    pub auto_detect: bool,
+    pub game_running: bool,
+    pub auto_suppressed: bool,
+    pub swap_enabled: bool,
+}
+
+impl SwapState {
+    pub fn new() -> Self {
+        Self {
+            auto_detect: true,
+            ..Default::default()
+        }
+    }
+
+    fn recalculate(&mut self) -> bool {
+        self.swap_enabled =
+            should_enable_swap(self.manual_swap, self.auto_detect, self.game_running, self.auto_suppressed);
+        self.swap_enabled
+    }
+
+    /// User clicked the Swap toggle in the tray menu.
+    pub fn toggle_swap(&mut self) -> bool {
+        if self.swap_enabled {
+            self.manual_swap = false;
+            self.auto_suppressed = true;
+        } else {
+            self.manual_swap = true;
+            self.auto_suppressed = false;
+        }
+        self.recalculate()
+    }
+
+    /// Game detector reported a state change.
+    pub fn on_game_state_changed(&mut self, running: bool) -> bool {
+        self.game_running = running;
+        self.auto_suppressed = false;
+        self.recalculate()
+    }
+
+    /// User toggled the Auto-detect checkbox.
+    pub fn toggle_auto_detect(&mut self) -> bool {
+        self.auto_detect = !self.auto_detect;
+        self.recalculate()
+    }
 }
 
 pub fn normalize_process_name(process_name: &str) -> String {
@@ -46,21 +101,124 @@ mod tests {
 
     #[test]
     fn swap_state_follows_manual_or_auto_game_rule() {
+        // (manual, auto, game, suppressed, expected)
         let cases = [
-            (false, false, false, false),
-            (false, false, true, false),
-            (false, true, false, false),
-            (false, true, true, true),
-            (true, false, false, true),
-            (true, false, true, true),
-            (true, true, false, true),
-            (true, true, true, true),
+            // No suppression — original truth table
+            (false, false, false, false, false),
+            (false, false, true, false, false),
+            (false, true, false, false, false),
+            (false, true, true, false, true),
+            (true, false, false, false, true),
+            (true, false, true, false, true),
+            (true, true, false, false, true),
+            (true, true, true, false, true),
+            // Suppressed — auto-detect is blocked, manual still works
+            (false, true, true, true, false),
+            (true, true, true, true, true),
         ];
 
-        for (manual, auto, game, expected) in cases {
-            assert_eq!(should_enable_swap(manual, auto, game), expected);
+        for (manual, auto, game, suppressed, expected) in cases {
+            assert_eq!(
+                should_enable_swap(manual, auto, game, suppressed),
+                expected,
+                "manual={manual}, auto={auto}, game={game}, suppressed={suppressed}"
+            );
         }
     }
+
+    // -- SwapState scenario tests --
+
+    #[test]
+    fn auto_detect_activates_swap_when_game_launches() {
+        let mut s = SwapState::new();
+        assert!(!s.swap_enabled);
+        s.on_game_state_changed(true);
+        assert!(s.swap_enabled);
+    }
+
+    #[test]
+    fn auto_detect_deactivates_swap_when_game_exits() {
+        let mut s = SwapState::new();
+        s.on_game_state_changed(true);
+        assert!(s.swap_enabled);
+        s.on_game_state_changed(false);
+        assert!(!s.swap_enabled);
+    }
+
+    #[test]
+    fn user_can_disable_swap_during_auto_detected_game() {
+        let mut s = SwapState::new();
+        s.on_game_state_changed(true);
+        assert!(s.swap_enabled);
+
+        // User clicks Swap to turn it off
+        s.toggle_swap();
+        assert!(!s.swap_enabled);
+    }
+
+    #[test]
+    fn suppression_clears_on_next_game_launch() {
+        let mut s = SwapState::new();
+        s.on_game_state_changed(true);
+        s.toggle_swap(); // suppress
+        assert!(!s.swap_enabled);
+
+        // Game exits and a new game launches
+        s.on_game_state_changed(false);
+        s.on_game_state_changed(true);
+        assert!(s.swap_enabled);
+    }
+
+    #[test]
+    fn manual_swap_works_independently_of_auto_detect() {
+        let mut s = SwapState::new();
+        s.toggle_swap(); // manual on
+        assert!(s.swap_enabled);
+        assert!(s.manual_swap);
+
+        s.toggle_swap(); // manual off (sets suppression, but no game running so irrelevant)
+        assert!(!s.swap_enabled);
+    }
+
+    #[test]
+    fn manual_on_then_game_launches_then_user_disables() {
+        let mut s = SwapState::new();
+        s.toggle_swap(); // manual on
+        assert!(s.swap_enabled);
+
+        s.on_game_state_changed(true); // game also running
+        assert!(s.swap_enabled);
+
+        s.toggle_swap(); // user wants off — suppresses auto AND clears manual
+        assert!(!s.swap_enabled);
+        assert!(!s.manual_swap);
+        assert!(s.auto_suppressed);
+    }
+
+    #[test]
+    fn toggle_auto_detect_off_disables_auto_swap() {
+        let mut s = SwapState::new();
+        s.on_game_state_changed(true);
+        assert!(s.swap_enabled);
+
+        s.toggle_auto_detect(); // auto off
+        assert!(!s.swap_enabled);
+    }
+
+    #[test]
+    fn user_re_enables_swap_after_suppressing() {
+        let mut s = SwapState::new();
+        s.on_game_state_changed(true);
+        s.toggle_swap(); // suppress → off
+        assert!(!s.swap_enabled);
+
+        s.toggle_swap(); // manual on, clears suppression
+        assert!(s.swap_enabled);
+        assert!(s.manual_swap);
+        assert!(!s.auto_suppressed);
+    }
+
+    // -- Process / key remap tests --
 
     #[test]
     fn watched_game_matching_is_case_insensitive() {
