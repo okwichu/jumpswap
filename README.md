@@ -19,6 +19,7 @@ JumpSwap auto-detects these games by process name:
 - Fortnite (`FortniteClient-Win64-Shipping.exe`)
 - Destiny 2 (`destiny2.exe`)
 - Marathon (`marathon.exe`)
+- Last Flag (`LastFlagClient-Win64-Shipping.exe`)
 
 The swap activates within ~3 seconds of game launch and deactivates when the game exits.
 

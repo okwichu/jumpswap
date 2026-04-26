@@ -4,7 +4,10 @@ pub const GAME_PROCESSES: &[&str] = &[
     "fortniteclient-win64-shipping.exe",
     "destiny2.exe",
     "marathon.exe",
+    "lastflagclient-win64-shipping.exe",
 ];
+
+pub const THE_FINALS_PROCESS: &str = "discovery.exe";
 
 pub const VK_RETURN_CODE: u16 = 0x0D;
 pub const VK_SPACE_CODE: u16 = 0x20;
@@ -77,10 +80,20 @@ pub fn is_watched_game_process(process_name: &str) -> bool {
     GAME_PROCESSES.iter().any(|game| normalized == *game)
 }
 
+pub fn is_the_finals_process(process_name: &str) -> bool {
+    normalize_process_name(process_name) == THE_FINALS_PROCESS
+}
+
 pub fn any_watched_game_running<'a>(
     process_names: impl IntoIterator<Item = &'a str>,
 ) -> bool {
     process_names.into_iter().any(is_watched_game_process)
+}
+
+pub fn any_the_finals_running<'a>(
+    process_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    process_names.into_iter().any(is_the_finals_process)
 }
 
 pub fn remap_virtual_key(vk_code: u16) -> Option<u16> {
@@ -231,6 +244,24 @@ mod tests {
     fn watched_game_matching_rejects_unknown_processes() {
         assert!(!is_watched_game_process("notepad.exe"));
         assert!(!is_watched_game_process("marathonlauncher.exe"));
+    }
+
+    #[test]
+    fn the_finals_is_recognized_case_insensitively() {
+        assert!(is_the_finals_process("Discovery.exe"));
+        assert!(is_the_finals_process("DISCOVERY.EXE"));
+        assert!(!is_the_finals_process("discoverylauncher.exe"));
+    }
+
+    #[test]
+    fn the_finals_is_not_on_the_swap_list() {
+        assert!(!is_watched_game_process("discovery.exe"));
+    }
+
+    #[test]
+    fn the_finals_scan_finds_match_among_other_processes() {
+        let processes = ["explorer.exe", "steam.exe", "Discovery.exe"];
+        assert!(any_the_finals_running(processes.iter().copied()));
     }
 
     #[test]
