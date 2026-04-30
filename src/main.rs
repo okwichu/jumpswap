@@ -36,8 +36,8 @@ const IDM_QUIT: u32 = 1003;
 const IDM_STARTUP: u32 = 1004;
 const IDM_FINALS_RES: u32 = 1005;
 
-const FINALS_RES_WIDTH: u32 = 1920;
-const FINALS_RES_HEIGHT: u32 = 1080;
+const FINALS_RES_WIDTH: u32 = 2560;
+const FINALS_RES_HEIGHT: u32 = 1440;
 const FINALS_RES_FREQ: u32 = 120;
 
 fn main() -> Result<()> {
@@ -209,7 +209,7 @@ fn find_external_display() -> Option<Vec<u16>> {
     }
 }
 
-/// Apply 1080p@120Hz to the given display, returning the prior DEVMODE on success.
+/// Apply the requested mode to the given display, returning the prior DEVMODE on success.
 fn apply_resolution(device: &[u16], width: u32, height: u32, freq: u32) -> Option<DEVMODEW> {
     unsafe {
         let mut current = DEVMODEW {
@@ -504,7 +504,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         fMask: MIIM_ID | MIIM_STATE | MIIM_STRING,
         wID: IDM_FINALS_RES,
         fState: if res_switch { MFS_CHECKED } else { MFS_UNCHECKED },
-        dwTypeData: PWSTR(w!("1080p @ 120Hz for THE FINALS").as_ptr() as *mut _),
+        dwTypeData: PWSTR(w!("1440p @ 120Hz for THE FINALS").as_ptr() as *mut _),
         ..Default::default()
     };
     let _ = InsertMenuItemW(menu, 2, true, &mut res_item);
